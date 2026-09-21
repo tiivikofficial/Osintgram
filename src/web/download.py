@@ -13,7 +13,7 @@ import io
 import posixpath
 import re
 import zipfile
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -22,11 +22,16 @@ import httpx
 ALLOWED_HOSTS = (".cdninstagram.com", ".fbcdn.net")
 MAX_FILES = 100
 MAX_TOTAL_BYTES = 300 * 1024 * 1024
+MAX_REDIRECTS = 3
 PER_FILE_TIMEOUT = 20.0
 
 
 class DownloadError(Exception):
     """The request cannot be served at all (nothing usable to download)."""
+
+
+class MediaFetchError(Exception):
+    """One media URL cannot be safely fetched into the archive."""
 
 
 def is_allowed(url: str) -> bool:
@@ -53,6 +58,45 @@ def _filename(url: str, index: int, used: set) -> str:
     return name
 
 
+def _fetch_content(client: httpx.Client, url: str, remaining_bytes: int) -> bytes:
+    """Fetch one media URL without following an unsafe redirect or size blowup."""
+    current = url
+    for redirect_index in range(MAX_REDIRECTS + 1):
+        if not is_allowed(current):
+            raise MediaFetchError("redirect target is not an allowed Instagram CDN host")
+        try:
+            with client.stream("GET", current, follow_redirects=False) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise MediaFetchError("redirect response has no Location header")
+                    current = urljoin(current, location)
+                    if redirect_index == MAX_REDIRECTS:
+                        raise MediaFetchError("too many redirects")
+                    continue
+
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > remaining_bytes:
+                            raise MediaFetchError("file exceeds the remaining archive size limit")
+                    except ValueError:
+                        pass
+
+                chunks = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > remaining_bytes:
+                        raise MediaFetchError("file exceeds the remaining archive size limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except httpx.HTTPError:
+            raise
+    raise MediaFetchError("too many redirects")
+
+
 def build_zip(urls: list) -> tuple:
     """Fetch every allowed URL and pack it. Returns (zip bytes, report).
 
@@ -71,18 +115,16 @@ def build_zip(urls: list) -> tuple:
     total = 0
     saved = 0
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:  # media is already compressed
-        with httpx.Client(timeout=PER_FILE_TIMEOUT, follow_redirects=True) as client:
+        with httpx.Client(timeout=PER_FILE_TIMEOUT, follow_redirects=False) as client:
             for index, url in enumerate(allowed, start=1):
                 if total >= MAX_TOTAL_BYTES:
                     errors.append(f"{url}\n  -> saltato: superato il limite complessivo di dimensione")
                     continue
                 try:
-                    response = client.get(url)
-                    response.raise_for_status()
-                except httpx.HTTPError as e:
+                    content = _fetch_content(client, url, MAX_TOTAL_BYTES - total)
+                except (httpx.HTTPError, MediaFetchError) as e:
                     errors.append(f"{url}\n  -> {type(e).__name__}: {e}")
                     continue
-                content = response.content
                 total += len(content)
                 saved += 1
                 archive.writestr(_filename(url, index, used), content)
