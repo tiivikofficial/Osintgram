@@ -14,10 +14,10 @@ CDN2 = "https://instagram.fmxp5-1.fna.fbcdn.net/v/t51/clip.mp4"
 @pytest.mark.parametrize("url, allowed", [
     (CDN, True),
     (CDN2, True),
-    ("http://scontent.cdninstagram.com/x.jpg", False),   # plain http
+    ("http://scontent.cdninstagram.com/x.jpg", False),
     ("https://evil.com/x.jpg", False),
-    ("https://cdninstagram.com.evil.com/x.jpg", False),  # look-alike host
-    ("https://127.0.0.1/secret", False),                 # no local network
+    ("https://cdninstagram.com.evil.com/x.jpg", False),
+    ("https://127.0.0.1/secret", False),
     ("file:///etc/passwd", False),
 ])
 def test_only_instagram_cdn_over_https_is_fetched(url, allowed):
@@ -25,14 +25,21 @@ def test_only_instagram_cdn_over_https_is_fetched(url, allowed):
 
 
 def _fake_transport(monkeypatch, handler):
-    """Route every httpx request in build_zip to `handler` (no network)."""
-    real_client = httpx.Client  # captured before patching, or we'd recurse
+    real_client = httpx.Client
 
     def client(**kwargs):
         kwargs.pop("transport", None)
         return real_client(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(download.httpx, "Client", client)
+
+
+class _ChunkStream(httpx.SyncByteStream):
+    def __init__(self, *chunks):
+        self._chunks = chunks
+
+    def __iter__(self):
+        yield from self._chunks
 
 
 def test_builds_a_zip_of_the_fetched_media(monkeypatch):
@@ -89,3 +96,56 @@ def test_file_count_is_capped(monkeypatch):
 def test_nothing_downloadable_raises():
     with pytest.raises(download.DownloadError):
         download.build_zip(["https://evil.com/x.jpg"])
+
+
+def test_redirect_to_disallowed_host_is_blocked(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"Location": "https://evil.com/secret.jpg"})
+        return httpx.Response(200, content=b"should-not-be-fetched")
+
+    _fake_transport(monkeypatch, handler)
+    content, report = download.build_zip([CDN])
+    assert report["saved"] == 0 and report["failed"] == 1
+    assert seen == [CDN]
+
+
+def test_redirect_within_allowed_cdn_is_followed(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"Location": CDN2})
+        return httpx.Response(200, content=b"redirected-media")
+
+    _fake_transport(monkeypatch, handler)
+    content, report = download.build_zip([CDN])
+    assert report == {"saved": 1, "failed": 0, "skipped": 0, "bytes": 15}
+    assert seen == [CDN, CDN2]
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        assert archive.read(archive.namelist()[0]) == b"redirected-media"
+
+
+def test_oversized_content_length_is_rejected(monkeypatch):
+    monkeypatch.setattr(download, "MAX_TOTAL_BYTES", 10)
+    _fake_transport(
+        monkeypatch,
+        lambda request: httpx.Response(200, headers={"Content-Length": "11"}, content=b"x" * 11),
+    )
+    content, report = download.build_zip([CDN])
+    assert report["saved"] == 0 and report["failed"] == 1
+
+
+def test_oversized_stream_without_content_length_is_rejected(monkeypatch):
+    monkeypatch.setattr(download, "MAX_TOTAL_BYTES", 5)
+
+    def handler(request):
+        return httpx.Response(200, stream=_ChunkStream(b"abc", b"def"))
+
+    _fake_transport(monkeypatch, handler)
+    content, report = download.build_zip([CDN])
+    assert report["saved"] == 0 and report["failed"] == 1
